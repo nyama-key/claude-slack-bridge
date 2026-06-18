@@ -177,7 +177,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── followup (実行中の追加指示キュー) ──
         "followup_queued": ":inbox_tray: 追加指示を受け付けました（実行中タスクの完了後に続けて実行します・待機 {count} 件）",
         "followup_queued_cancel": ":fast_forward: 実行中タスクを中断して、追加指示を反映します",
-        "followup_firing": ":arrow_forward: 追加指示を実行します",
+        "followup_firing": ":arrow_forward: 追加指示を実行します: {instruction}",
         "followup_cancel_prefix": "（前のタスクは新しい指示のため中断されました。これまでの作業内容を踏まえて、続けて次の指示に対応してください）\n\n追加指示: ",
         "followup_dropped": "（キュー済みの追加指示 {count} 件も破棄しました）",
 
@@ -305,6 +305,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "home_more": "_他 {count} 件_",
         "home_open_thread": ":speech_balloon: スレッドを開く",
         "home_truncated": "_…表示上限に達したため一部を省略しました_",
+        "home_overview": ":open_file_folder: {groups} ディレクトリ  ·  進行中 {running}  ·  終了 {finished}",
+        "home_group_summary": "_(進行中 {running} · 終了 {finished})_",
+        "home_group_unknown": "（場所不明）",
+        "home_ext_line": ":computer: 外部プロセス PID `{pid}`  :clock1: {etime}",
         "home_fork_button": "fork",
         "home_not_allowed": ":lock: このダッシュボードを表示する権限がありません。",
         "home_dur_sec": "{n}秒",
@@ -492,7 +496,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── followup (queued instructions while a task is running) ──
         "followup_queued": ":inbox_tray: Got it — queued to run after the current task finishes ({count} waiting)",
         "followup_queued_cancel": ":fast_forward: Interrupting the running task to apply your new instruction",
-        "followup_firing": ":arrow_forward: Running the queued instruction",
+        "followup_firing": ":arrow_forward: Running the queued instruction: {instruction}",
         "followup_cancel_prefix": "(The previous task was interrupted in favor of a new instruction. Building on the work done so far, please continue with the following.)\n\nAdditional instruction: ",
         "followup_dropped": "(Also discarded {count} queued instruction(s))",
 
@@ -621,6 +625,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "home_more": "_{count} more_",
         "home_open_thread": ":speech_balloon: Open thread",
         "home_truncated": "_…truncated to fit the display limit_",
+        "home_overview": ":open_file_folder: {groups} dirs  ·  running {running}  ·  finished {finished}",
+        "home_group_summary": "_(running {running} · finished {finished})_",
+        "home_group_unknown": "(unknown location)",
+        "home_ext_line": ":computer: external PID `{pid}`  :clock1: {etime}",
         "home_fork_button": "fork",
         "home_not_allowed": ":lock: You are not allowed to view this dashboard.",
         "home_dur_sec": "{n}s",

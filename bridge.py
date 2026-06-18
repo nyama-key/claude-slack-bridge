@@ -540,6 +540,9 @@ class Task:
     # プロセス管理（実行中のみ）
     process: Optional[subprocess.Popen] = None
     master_fd: Optional[int] = None
+    # 最終JSONL活動時刻。プロセス生存でも JSONL 無活動が続けば「ハング」とみなす判断に使う
+    # （socket wedge 時の再起動ガードがハングタスクに人質に取られるのを防ぐ）。
+    last_activity: float = field(default_factory=time.time)
 
     # セッション継続（Session.claude_session_id から自動設定）
     resume_session: Optional[str] = None
@@ -1603,6 +1606,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                                 has_sub_status = True
                     if has_sub_status:
                         last_jsonl_update = time.time()
+                        if task_ref:
+                            task_ref.last_activity = last_jsonl_update
                         _flush_progress()
                     continue
 
@@ -1617,6 +1622,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
         # エントリを分類して処理
         last_jsonl_update = time.time()
+        if task_ref:
+            task_ref.last_activity = last_jsonl_update
         text_parts: list[str] = []
         has_status = False
 
@@ -2420,12 +2427,22 @@ class ClaudeCodeRunner:
         この時点で _execute は JSONL を読み切り、session.claude_session_id は確定済み
         （取得できなければ resume 先が存在しないので新規タスクとして起動）。"""
         with self.lock:
+            # ツール許可リクエスト待ち中はキューを発火しない。
+            # タスクが [TOOL_REQUEST:...] を返して終了した場合、ユーザーが
+            # Slack のボタンで応答するまで保留する（承認/却下＋コメント →
+            # その再実行タスクの finally がキューを処理、却下のみ → 終了するので
+            # _handle_tool_request_action からここを呼び直してキューを処理）。
+            if session.pending_tool_request is not None:
+                logger.info("_fire_one_followup: deferred (pending_tool_request) thread=%s",
+                            session.thread_ts)
+                return
             if not session.pending_followup:
                 return
             fu = session.pending_followup.pop(0)
         text = fu.get("text", "")
         if not text or not text.strip():
             return
+        instruction_preview = text.strip().replace("\n", " ")[:80]  # 補足前置前の生の指示（表示用）
         # cancel モード（@bot cancel <指示>）: 中断した旨の補足を前置して文脈を補う
         if fu.get("mode") == "cancel":
             text = t("followup_cancel_prefix") + text
@@ -2456,7 +2473,7 @@ class ClaudeCodeRunner:
             session.channel_id, fu.get("request_msg_ts"), session.thread_ts,
         )
         self._swap_task_reaction(task, REACTION_RECEIVED)
-        self._post_to_session(session, t("followup_firing"))
+        self._post_to_session(session, t("followup_firing", instruction=instruction_preview))
         err = self.run_task(project, session, task)
         if err:
             self._post_to_session(session, err)
@@ -3145,6 +3162,24 @@ class ClaudeCodeRunner:
                         and active.process and active.process.poll() is None):
                     return True
         return False
+
+    def all_running_tasks_stale(self, threshold: float) -> bool:
+        """走行中タスクが1つ以上あり、その全てが threshold 秒以上 JSONL 無活動か。
+        プロセスは生存していても JSONL が長時間無更新なら「ハング」とみなす。
+        socket wedge 時の再起動判断で使い、ハングタスクが has_running_tasks() の
+        再起動ガードを人質に取って死んだ socket を永久に復旧できなくする事故を防ぐ。
+        1つでも活動中のタスクがあれば False（巻き添えにしない）。"""
+        now = time.time()
+        found = False
+        for project in self.projects.values():
+            for session in project.sessions.values():
+                active = session.active_task
+                if (active and active.status == TaskStatus.RUNNING
+                        and active.process and active.process.poll() is None):
+                    found = True
+                    if (now - active.last_activity) < threshold:
+                        return False
+        return found
 
 
 def _capture_edit_diff(task: Task, tool_name: str, tool_input: dict):
@@ -4072,6 +4107,13 @@ def _handle_tool_request_action(ack, body, scope: str):
             # 却下＋コメント無し: 前タスク自体は正常完了していたので white_check_mark に戻す
             if prev_task:
                 runner._swap_task_reaction(prev_task, REACTION_COMPLETED)
+            # タスクはここで完全に終了。_execute の finally では pending_tool_request
+            # が立っていたため保留されていた追加指示キューを、ここで発火する。
+            # （pending_tool_request は上で None 済みなのでガードは通過する）
+            try:
+                runner._fire_one_followup(project, session)
+            except Exception as e:
+                logger.warning("_fire_one_followup after reject failed: %s", e)
             return
         # 却下＋コメントあり: コメントをClaudeに伝えるため --resume で再開
         if not session.claude_session_id:
@@ -4303,6 +4345,114 @@ def _collect_dashboard_sessions() -> dict:
     }
 
 
+def _dir_key(path: Optional[str]) -> Optional[str]:
+    """working_dir / cwd を正規化したグルーピングキー。不明なら None。"""
+    if not path:
+        return None
+    try:
+        return os.path.normpath(os.path.expanduser(path))
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso_ts(iso_str: Optional[str]) -> float:
+    if not iso_str:
+        return 0.0
+    try:
+        return datetime.fromisoformat(iso_str).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _group_dashboard_by_dir(running_bridge: list, running_external: list,
+                            finished: list) -> list:
+    """進行中(ブリッジ/外部) + 終了済み を working_dir 単位に統合したグループ列を返す。
+    並び: 進行中アイテムを含むグループ優先 → 直近アクティビティの降順。
+    各グループ内: ブリッジ進行中 → 外部進行中 → 終了済み（各々 recency 降順）。"""
+    now = datetime.now().timestamp()
+    groups: dict[str, dict] = {}
+
+    def grp(path: Optional[str]) -> dict:
+        key = _dir_key(path) or "?"
+        g = groups.get(key)
+        if not g:
+            g = {"key": key, "path": (key if key != "?" else None),
+                 "bridge": [], "external": [], "finished": [], "recency": 0.0}
+            groups[key] = g
+        return g
+
+    for s in running_bridge:
+        rec = now - float(s.get("elapsed") or 0)
+        s["_recency"] = rec
+        g = grp(s.get("working_dir"))
+        g["bridge"].append(s)
+        g["recency"] = max(g["recency"], rec)
+    for ext in running_external:
+        ext["_recency"] = now
+        g = grp(ext.get("cwd"))
+        g["external"].append(ext)
+        g["recency"] = max(g["recency"], now)
+    for e in finished:
+        rec = _iso_ts(e.get("completed_at"))
+        e["_recency"] = rec
+        g = grp(e.get("working_dir"))
+        g["finished"].append(e)
+        g["recency"] = max(g["recency"], rec)
+
+    for g in groups.values():
+        g["bridge"].sort(key=lambda x: x["_recency"], reverse=True)
+        g["finished"].sort(key=lambda x: x["_recency"], reverse=True)
+        g["has_running"] = bool(g["bridge"] or g["external"])
+
+    return sorted(groups.values(),
+                  key=lambda g: (g["has_running"], g["recency"]), reverse=True)
+
+
+def _home_bridge_block(s: dict) -> dict:
+    link = _slack_thread_link(s["channel_id"], s["thread_ts"], s.get("anchor_ts"))
+    user_field = f"<@{s['user_id']}>" if s["user_id"] else "-"
+    recent = " → ".join(f"`{n}`" for n in s["recent_tools"]) if s["recent_tools"] else "-"
+    return {
+        "type": "section",
+        "text": {"type": "mrkdwn",
+                 "text": f":gear: {s['label_emoji']} <{link}|{t('home_open_thread')}>  "
+                         f"_{_dash_truncate(s['prompt'], 80)}_"},
+        "fields": [
+            {"type": "mrkdwn", "text": f"*User:* {user_field}"},
+            {"type": "mrkdwn", "text": f"*Time:* {_fmt_duration(s['elapsed'])}"},
+            {"type": "mrkdwn", "text": f"*Tools:* {s['tool_count']}  {recent}"},
+        ],
+    }
+
+
+def _home_external_block(ext: dict) -> dict:
+    cwd = ext.get("cwd") or "(unknown)"
+    return {
+        "type": "section",
+        "text": {"type": "mrkdwn",
+                 "text": t("home_ext_line", pid=ext["pid"], etime=ext.get("etime") or "?")},
+        "accessory": {
+            "type": "button",
+            "text": {"type": "plain_text", "text": t("home_fork_button"), "emoji": True},
+            "action_id": "home_fork",
+            "value": json.dumps({"pid": ext["pid"], "cwd": cwd}),
+        },
+    }
+
+
+def _home_finished_block(e: dict) -> dict:
+    emoji = _FINISHED_STATUS_EMOJI.get(e.get("latest_status"), ":grey_question:")
+    link = _slack_thread_link(e["channel_id"], e["thread_ts"], e.get("latest_msg_ts"))
+    when = _fmt_completed_at(e.get("completed_at"))
+    label = e.get("label_emoji") or ""
+    return {
+        "type": "section",
+        "text": {"type": "mrkdwn",
+                 "text": f"{emoji} {label} <{link}|{t('home_open_thread')}>  "
+                         f"_{_dash_truncate(e.get('latest_prompt', ''), 60)}_ · {when}"},
+    }
+
+
 def _build_home_view(viewer_user_id: str, show_all: bool) -> dict:
     """Block Kit の Home ビューを構築。show_all=False なら viewer 本人のセッションのみ。"""
     data = _collect_dashboard_sessions()
@@ -4342,89 +4492,69 @@ def _build_home_view(viewer_user_id: str, show_all: bool) -> dict:
     })
     blocks.append({"type": "divider"})
 
-    # 進行中（ブリッジ管理）
-    blocks.append({
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": t("home_section_running", count=len(running_bridge))},
-    })
-    if running_bridge:
-        for s in running_bridge[:20]:
-            link = _slack_thread_link(s["channel_id"], s["thread_ts"], s.get("anchor_ts"))
-            dir_name = os.path.basename(s["working_dir"]) if s["working_dir"] else "?"
-            user_field = f"<@{s['user_id']}>" if s["user_id"] else "-"
-            recent = " → ".join(f"`{n}`" for n in s["recent_tools"]) if s["recent_tools"] else "-"
-            blocks.append({
-                "type": "section",
-                "text": {"type": "mrkdwn",
-                         "text": f"{s['label_emoji']} <{link}|{t('home_open_thread')}>  "
-                                 f"_{_dash_truncate(s['prompt'], 80)}_"},
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Dir:* `{dir_name}`"},
-                    {"type": "mrkdwn", "text": f"*User:* {user_field}"},
-                    {"type": "mrkdwn", "text": f"*Time:* {_fmt_duration(s['elapsed'])}"},
-                    {"type": "mrkdwn", "text": f"*Tools:* {s['tool_count']}  {recent}"},
-                ],
-            })
-        if len(running_bridge) > 20:
-            blocks.append({"type": "context", "elements": [
-                {"type": "mrkdwn", "text": t("home_more", count=len(running_bridge) - 20)}]})
-    else:
+    # ── ワーキングディレクトリ単位でグループ化して表示 ──
+    groups = _group_dashboard_by_dir(running_bridge, running_external, finished)
+    total_running = len(running_bridge) + len(running_external)
+    total_finished = len(finished)
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+        "text": t("home_overview", groups=len(groups),
+                  running=total_running, finished=total_finished)}]})
+
+    if not groups:
         blocks.append({"type": "context", "elements": [
             {"type": "mrkdwn", "text": t("home_none")}]})
 
-    # 進行中（外部 / ターミナル）
-    if running_external:
+    # Slack の Home ビューは最大100ブロック。進行中は全件、終了済みは合計
+    # SESSION_HISTORY_DISPLAY 件まで表示し、超過分は省略する。
+    BLOCK_LIMIT = 96
+    finished_budget = SESSION_HISTORY_DISPLAY
+    shown_finished = 0
+    truncated = False
+    for g in groups:
+        if len(blocks) >= BLOCK_LIMIT:
+            truncated = True
+            break
         blocks.append({"type": "divider"})
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": t("home_section_external", count=len(running_external))},
-        })
-        for ext in running_external[:20]:
-            cwd = ext.get("cwd") or "(unknown)"
-            blocks.append({
-                "type": "section",
-                "text": {"type": "mrkdwn",
-                         "text": f":computer: PID `{ext['pid']}`  :file_folder: `{cwd}`  "
-                                 f":clock1: {ext.get('etime') or '?'}"},
-                "accessory": {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": t("home_fork_button"), "emoji": True},
-                    "action_id": "home_fork",
-                    "value": json.dumps({"pid": ext["pid"], "cwd": cwd}),
-                },
-            })
-        if len(running_external) > 20:
+        running_n = len(g["bridge"]) + len(g["external"])
+        name = (os.path.basename(g["key"]) or g["key"]) if g["path"] else t("home_group_unknown")
+        summary = t("home_group_summary", running=running_n, finished=len(g["finished"]))
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": f":file_folder: *{name}*  {summary}"}})
+        if g["path"]:
             blocks.append({"type": "context", "elements": [
-                {"type": "mrkdwn", "text": t("home_more", count=len(running_external) - 20)}]})
+                {"type": "mrkdwn", "text": f"`{g['path']}`"}]})
+        for s in g["bridge"]:
+            if len(blocks) >= BLOCK_LIMIT:
+                truncated = True
+                break
+            blocks.append(_home_bridge_block(s))
+        if truncated:
+            break
+        for ext in g["external"]:
+            if len(blocks) >= BLOCK_LIMIT:
+                truncated = True
+                break
+            blocks.append(_home_external_block(ext))
+        if truncated:
+            break
+        for e in g["finished"]:
+            if shown_finished >= finished_budget:
+                break
+            if len(blocks) >= BLOCK_LIMIT:
+                truncated = True
+                break
+            blocks.append(_home_finished_block(e))
+            shown_finished += 1
+        if truncated:
+            break
 
-    # 終了済み
-    blocks.append({"type": "divider"})
-    blocks.append({
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": t("home_section_finished", count=len(finished))},
-    })
-    if finished:
-        for e in finished[:SESSION_HISTORY_DISPLAY]:
-            emoji = _FINISHED_STATUS_EMOJI.get(e.get("latest_status"), ":grey_question:")
-            link = _slack_thread_link(e["channel_id"], e["thread_ts"], e.get("latest_msg_ts"))
-            dir_name = os.path.basename(e["working_dir"]) if e.get("working_dir") else "?"
-            when = _fmt_completed_at(e.get("completed_at"))
-            label = e.get("label_emoji") or ""
-            # section ブロックにして、進行中と同様にスレッドへ明確にジャンプできるようにする
-            blocks.append({
-                "type": "section",
-                "text": {"type": "mrkdwn",
-                         "text": f"{emoji} {label} <{link}|{t('home_open_thread')}>  "
-                                 f":file_folder:`{dir_name}` "
-                                 f"_{_dash_truncate(e.get('latest_prompt', ''), 60)}_ "
-                                 f"· {when}"},
-            })
-        if len(finished) > SESSION_HISTORY_DISPLAY:
-            blocks.append({"type": "context", "elements": [
-                {"type": "mrkdwn", "text": t("home_more", count=len(finished) - SESSION_HISTORY_DISPLAY)}]})
-    else:
+    remaining_finished = total_finished - shown_finished
+    if remaining_finished > 0:
         blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": t("home_none")}]})
+            {"type": "mrkdwn", "text": t("home_more", count=remaining_finished)}]})
+    if truncated:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": t("home_truncated")}]})
 
     # Slack の Home ビューは最大100ブロック。安全側で丸める。
     if len(blocks) > 98:
@@ -6503,25 +6633,29 @@ def main():
                 )
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN, trace_enabled=True)
-
-    # ── 連続エラー検知 → エクスポネンシャルバックオフ再接続 ──
-    # Socket Modeエラーが連続する場合、SDKの自動再接続を無効にし、
-    # バックオフしながら自前で再接続を試みる。
-    # 最大リトライ回数を超えたらプロセスを終了し、launchctlに再起動させる。
-    _SM_BACKOFF_INITIAL = 2.0       # 初回待機秒数
-    _SM_BACKOFF_MAX = 60.0          # 最大待機秒数
-    _SM_BACKOFF_FACTOR = 2.0        # 倍率
-    _SM_MAX_RETRIES = 10            # この回数を超えたら終了
-    # _SM_BACKOFF_MAX より十分大きい値にする。等しいと
-    # 「バックオフ最大値で待機→新エラー→経過 > RESET_AFTER でリセット」
-    # の経路でカウンタが永遠に MAX_RETRIES に届かない無限ループに陥る。
-    _SM_RESET_AFTER = 600.0         # エラーなしでこの秒数経過したらカウンタリセット
+    # ── Socket Mode の接続健全性監視 → 必要なら再起動 ──
+    # 【再接続は SDK 内蔵監視(current_app_monitor)に一本化する】
+    # SDK は check_state(=ping) と recv の両パスの失敗を検知し connect_to_new_endpoint で
+    # 自動再接続する。ここでブリッジ側からも再接続すると「2つの再接続主体が互いの張りたて
+    # ソケットを close し合う」レースで wedge するため、ブリッジは再接続を一切行わない。
+    # （default_auto_reconnect_enabled は SDK 既定の True のままにし、無効化しない）
+    #
+    # 【回復判断はエラーコールバックでなく is_connected() のポーリングで行う】
+    # on_error_listeners は recv パスでしか発火せず、ping パス(check_state)の失敗を取りこぼす。
+    # 実際 2026-06-18 の事故では ping パスで切断したのに自前ループが起動せず、
+    # auto_reconnect も無効化していたため誰も再接続せず無限沈黙した。
+    # そこで失敗パスに依存しないよう、接続状態そのものを定期ポーリングするのを唯一の真実とする。
+    # 一定時間 切断が継続し かつ Slack 到達可 かつ (走行タスク無し or 全ハング) なら、
+    # SDK 自動再接続でも回復しない内部状態破損とみなしプロセスを終了し launchd に再起動させる。
+    # これで recv / ping / silent いずれの wedge も上限時間内に必ず回復する。
+    _SM_HEALTH_CHECK_INTERVAL = 15.0    # 接続状態ポーリング間隔（秒）
     _SM_DISCONNECT_NOTIFY_AFTER = 10.0  # 切断がこの秒数継続したらmacOS通知
-    _sm_consecutive_errors = 0
-    _sm_last_error_time: float = 0.0
-    _sm_disconnect_since: float = 0.0   # 切断開始時刻 (0 = 切断中でない)
-    _sm_reconnecting = False            # バックオフ再接続処理中フラグ
-    _sm_disconnect_notify_timer: Optional[threading.Timer] = None  # 切断通知の遅延タイマー
+    _SM_RESTART_AFTER = 120.0           # 切断がこの秒数継続したら再起動を検討
+    # 走行中タスクがこの秒数以上 JSONL 無活動なら「ハング」とみなし、socket wedge 時の
+    # 再起動見送りガードを解除する（ハングタスクに人質を取られて socket を復旧できない事故対策）。
+    # 正当な長時間 Bash（ビルド等）の巻き添えを避けるため十分大きく取る。--resume で再開可能。
+    _TASK_STALE_RESTART_SEC = 900.0
+    _sm_disconnect_since: float = 0.0   # 連続切断の開始時刻 (0 = 接続中)
     _sm_disconnect_notified = False     # 切断通知済みフラグ（通知済みの場合のみ復帰通知を出す）
 
     def _macos_notify(title: str, message: str):
@@ -6542,176 +6676,97 @@ def main():
             return f"{minutes}分{secs}秒"
         return f"{secs}秒"
 
-    def _fire_disconnect_notification():
-        """切断が _SM_DISCONNECT_NOTIFY_AFTER 秒以上継続した際のmacOS通知"""
-        nonlocal _sm_disconnect_notified
-        if _sm_disconnect_since == 0.0:
-            return
-        elapsed = int(time.time() - _sm_disconnect_since)
-        _sm_disconnect_notified = True
-        _macos_notify(
-            "Claude Slack Bridge",
-            f"Slack接続が切断しました（{_format_duration(elapsed)}以上）",
-        )
+    def _socket_health_watchdog_loop():
+        """接続状態を実ポーリングし、長時間切断なら再起動する独立 watchdog。
+        再接続自体は SDK 監視に委ね、ここは「回復できているか」だけを is_connected() で
+        監視する。失敗パス(recv/ping)に依存しないので silent wedge も確実に検知できる。"""
+        nonlocal _sm_disconnect_since, _sm_disconnect_notified
+        while not _shutdown_event.is_set():
+            _shutdown_event.wait(timeout=_SM_HEALTH_CHECK_INTERVAL)
+            if _shutdown_event.is_set():
+                break
+            try:
+                connected = handler.client is not None and handler.client.is_connected()
+            except Exception:
+                connected = False
 
-    def _notify_reconnected():
-        """接続回復時のmacOS通知（切断通知済みの場合のみ）"""
-        nonlocal _sm_disconnect_notify_timer, _sm_disconnect_notified
-        elapsed = int(time.time() - _sm_disconnect_since) if _sm_disconnect_since else 0
-        logger.info(
-            "Socket Mode 接続回復（%d回リトライ、切断時間 %d秒）",
-            _sm_consecutive_errors, elapsed,
-        )
-        # 待機中の切断通知タイマーをキャンセル
-        if _sm_disconnect_notify_timer is not None:
-            _sm_disconnect_notify_timer.cancel()
-            _sm_disconnect_notify_timer = None
-        # 切断通知を出した場合のみ復帰通知を出す
-        if _sm_disconnect_notified:
-            _macos_notify(
-                "Claude Slack Bridge",
-                f"Slack接続が回復しました（切断 {_format_duration(elapsed)}）",
-            )
-        _sm_disconnect_notified = False
-
-    def _on_socket_error(error: Exception):
-        """エラー発生時: SDKの自動再接続を無効にし、バックオフ付き再接続スレッドを起動"""
-        nonlocal _sm_consecutive_errors, _sm_last_error_time, _sm_disconnect_since
-        nonlocal _sm_reconnecting, _sm_disconnect_notify_timer
-        now = time.time()
-
-        # 前回エラーから十分時間が経過していればカウンタリセット
-        if _sm_last_error_time and (now - _sm_last_error_time) > _SM_RESET_AFTER:
-            _sm_consecutive_errors = 0
-            _sm_disconnect_since = 0.0
-
-        _sm_consecutive_errors += 1
-        _sm_last_error_time = now
-        if _sm_disconnect_since == 0.0:
-            _sm_disconnect_since = now
-
-        # SDKの自動再接続を無効化（モニタースレッドが勝手に再接続するのを防ぐ）
-        handler.client.auto_reconnect_enabled = False
-
-        logger.warning(
-            "Socket Mode エラー #%d: %s",
-            _sm_consecutive_errors, error,
-        )
-
-        # 初回エラー時: 10秒後に切断通知を出すタイマーを起動
-        # （10秒以内に復帰すればタイマーはキャンセルされ通知は出ない）
-        if _sm_disconnect_notify_timer is None and not _sm_disconnect_notified:
-            _sm_disconnect_notify_timer = threading.Timer(
-                _SM_DISCONNECT_NOTIFY_AFTER, _fire_disconnect_notification,
-            )
-            _sm_disconnect_notify_timer.daemon = True
-            _sm_disconnect_notify_timer.start()
-
-        # バックオフ再接続スレッドが未起動なら起動
-        if not _sm_reconnecting:
-            _sm_reconnecting = True
-            threading.Thread(
-                target=_backoff_reconnect_loop,
-                name="sm-backoff-reconnect",
-                daemon=True,
-            ).start()
-
-    def _backoff_reconnect_loop():
-        """バックオフ付き再接続ループ（専用スレッド）"""
-        nonlocal _sm_consecutive_errors, _sm_last_error_time
-        nonlocal _sm_disconnect_since, _sm_reconnecting
-        try:
-            while True:
-                delay = min(
-                    _SM_BACKOFF_INITIAL * (_SM_BACKOFF_FACTOR ** (_sm_consecutive_errors - 1)),
-                    _SM_BACKOFF_MAX,
-                )
-
-                if _sm_consecutive_errors >= _SM_MAX_RETRIES:
-                    elapsed = int(time.time() - _sm_disconnect_since)
-                    # 再起動は「プロセス内部状態の破損」をクリアする最終手段。
-                    # ただし次の2ケースでは再起動が逆効果なので見送り、再接続を続ける:
-                    #   1) 回線/Slack 到達不可 → 再起動しても同じ再接続をやり直すだけで無力。
-                    #      回線復旧まで静かに待つ方がよい（プロセス churn と走行中タスク喪失を避ける）。
-                    #   2) 走行中タスクあり → 再起動は実行中の作業を巻き添えに殺す。
-                    #      タスクはサブプロセス+JSONL監視で動き Slack socket に依存しないため、
-                    #      接続不良中も走り続けられる。タスクが捌けるまで再起動を保留する。
-                    reachable = _slack_reachable()
-                    if reachable and not runner.has_running_tasks():
-                        logger.critical(
-                            "Socket Mode で %d回連続エラー（%d秒間切断）。"
-                            "回線は到達可・走行中タスク無しのため、内部状態の破損とみなし"
-                            "プロセスを終了し再起動します。",
-                            _sm_consecutive_errors, elapsed,
-                        )
+            now = time.time()
+            if connected:
+                # 回復: 切断を検知していたら（必要なら）復帰通知してリセット
+                if _sm_disconnect_since > 0:
+                    elapsed = int(now - _sm_disconnect_since)
+                    logger.info("Socket Mode 接続回復（切断 %d秒）", elapsed)
+                    if _sm_disconnect_notified:
                         _macos_notify(
                             "Claude Slack Bridge",
-                            f"接続エラーが{_sm_consecutive_errors}回連続。"
-                            "プロセスを再起動します。",
+                            f"Slack接続が回復しました（切断 {_format_duration(elapsed)}）",
                         )
-                        try:
-                            runner.save_sessions()
-                        except Exception:
-                            pass
-                        os._exit(1)
-                    # 再起動見送り: 理由をログし、最大バックオフで待って再接続を継続する。
+                _sm_disconnect_since = 0.0
+                _sm_disconnect_notified = False
+                continue
+
+            # 切断中
+            if _sm_disconnect_since == 0.0:
+                _sm_disconnect_since = now
+                logger.warning("Socket Mode 切断を検知（SDK 自動再接続を待機）")
+                continue
+            elapsed = int(now - _sm_disconnect_since)
+
+            # 切断が一定継続 → macOS 通知（一度だけ）
+            if not _sm_disconnect_notified and elapsed >= _SM_DISCONNECT_NOTIFY_AFTER:
+                _sm_disconnect_notified = True
+                _macos_notify(
+                    "Claude Slack Bridge",
+                    f"Slack接続が切断しました（{_format_duration(elapsed)}以上）",
+                )
+
+            # 切断が _SM_RESTART_AFTER 継続 → 再起動を検討
+            # 再起動は「SDK 自動再接続でも回復しないプロセス内部状態の破損」の最終手段。
+            # 次の2ケースは再起動が逆効果なので見送り、継続監視する:
+            #   1) 回線/Slack 到達不可 → 再起動しても無力。回線復旧を静かに待つ。
+            #   2) 走行中タスクあり → 巻き添えで殺す。タスクは socket に依存せず走り続けられる。
+            #      ただし全タスクが長時間ハングしているなら人質を解いて再起動する。
+            if elapsed >= _SM_RESTART_AFTER:
+                reachable = _slack_reachable()
+                has_tasks = runner.has_running_tasks()
+                stale = has_tasks and runner.all_running_tasks_stale(_TASK_STALE_RESTART_SEC)
+                if reachable and (not has_tasks or stale):
+                    logger.critical(
+                        "Socket Mode が %d秒間切断（SDK 自動再接続でも回復せず）。"
+                        "回線は到達可・%sのため内部状態破損とみなしプロセスを終了し再起動します。",
+                        elapsed,
+                        ("走行中タスクは全てハング(無活動>%d秒)" % int(_TASK_STALE_RESTART_SEC))
+                        if stale else "走行中タスク無し",
+                    )
+                    _macos_notify(
+                        "Claude Slack Bridge",
+                        f"Slack接続が{_format_duration(elapsed)}復旧しないため再起動します。",
+                    )
+                    try:
+                        runner.save_sessions()
+                    except Exception:
+                        pass
+                    os._exit(1)
+                else:
                     reason = "回線/Slack 到達不可" if not reachable else "走行中タスクあり"
                     logger.warning(
-                        "Socket Mode で %d回連続エラー（%d秒間切断）だが、%sのため"
-                        "再起動を見送り再接続を継続します。",
-                        _sm_consecutive_errors, elapsed, reason,
+                        "Socket Mode が %d秒間切断だが、%sのため再起動を見送り継続監視します。",
+                        elapsed, reason,
                     )
-                    time.sleep(_SM_BACKOFF_MAX)
-                else:
-                    logger.info(
-                        "Socket Mode 再接続 #%d: %.1f秒後にリトライ",
-                        _sm_consecutive_errors, delay,
-                    )
-                    time.sleep(delay)
 
-                try:
-                    handler.client.connect_to_new_endpoint()
-                    # ハンドシェイクは成功したが、新しい接続から実際に
-                    # メッセージが流れるかはまだ未確認。
-                    # 蓋閉じスリープ復帰直後など「接続は張れるが pong 送信時に
-                    # 即 BrokenPipe で切れる」ケースで、カウンタを 0 リセットすると
-                    # _SM_MAX_RETRIES に永遠に到達できず無限ループに陥るため、
-                    # ここではカウンタを操作しない。
-                    # 実カウンタリセットは _on_message_received（Slack の hello 等
-                    # 実メッセージ受信）でのみ行う。
-                    # 注: SDK の connect_to_new_endpoint() は内部で
-                    # auto_reconnect_enabled を default_auto_reconnect_enabled に
-                    # 戻すので、こちらで再有効化する必要はない。
-                    logger.info(
-                        "Socket Mode 再接続: 新エンドポイント接続成功"
-                        "（実メッセージ受信待ち）"
-                    )
-                    break
-                except Exception as e:
-                    _sm_consecutive_errors += 1
-                    _sm_last_error_time = time.time()
-                    logger.warning(
-                        "Socket Mode 再接続失敗 #%d: %s",
-                        _sm_consecutive_errors, e,
-                    )
-        finally:
-            _sm_reconnecting = False
-
-    def _on_message_received(client, message, raw_message):
-        """メッセージ受信成功 → 切断通知状態をリセット"""
-        nonlocal _sm_disconnect_since
-        # NOTE: _sm_consecutive_errors と _sm_last_error_time はここではリセットしない。
-        # 蓋閉じスリープ復帰直後の「Slack が hello を一発配信した直後に WS が
-        # 即 BrokenPipe で切れる」パターンでは、hello 受信ごとに
-        # _sm_consecutive_errors が 0 にリセットされてしまうと _SM_MAX_RETRIES に
-        # 永遠に到達できず無限ループに陥る。カウンタリセットは _on_socket_error 内の
-        # 時間ベースのチェック（>_SM_RESET_AFTER 秒の無エラー）でのみ行う。
-        if _sm_consecutive_errors > 0 and _sm_disconnect_since > 0:
-            _notify_reconnected()
-        _sm_disconnect_since = 0.0
+    def _on_socket_error(error: Exception):
+        """エラーは可視化のためログするのみ。再接続は SDK 監視に委ね、回復の判断は
+        watchdog の is_connected() ポーリングが行う（ping パスのエラーは
+        on_error_listeners を発火しないため、状態判断をコールバックに依存させない）。"""
+        logger.warning("Socket Mode エラー: %s", error)
 
     handler.client.on_error_listeners.append(_on_socket_error)
-    handler.client.message_listeners.append(_on_message_received)
+
+    threading.Thread(
+        target=_socket_health_watchdog_loop,
+        name="sm-health-watchdog",
+        daemon=True,
+    ).start()
 
     def shutdown(signum, frame):
         logger.info("Shutting down...")
