@@ -152,8 +152,10 @@ CHANNEL_ROOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "c
 PROJECT_TOOLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "project_tools.json")
 DIRECTORY_HISTORY_MAX = 10
 SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
-SESSIONS_MAX_AGE_DAYS = 7
-SESSIONS_MAX_PER_CHANNEL = 50
+# セッションの永続化に期限・件数上限は設けない。
+# claude_session_id の実体(~/.claude/projects/*/.jsonl)が Claude CLI 側に残る限り
+# --resume は成立するため、ブリッジ側で先に忘れると resume 可能なセッションを失う。
+# 各エントリは数百バイトと軽量で、スレッド数自体が利用に比例して自然に頭打ちになる。
 # プロセス突然死時の進行中タスクをトラッキング。
 # タスク開始/終了時にライブ書き換え。次回起動時に残っているエントリ = 中断タスク。
 INTERRUPTED_TASKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interrupted_tasks.json")
@@ -2074,7 +2076,6 @@ class ClaudeCodeRunner:
     def save_sessions(self):
         """セッション情報を永続化（未ロードチャンネルの既存データを保持）"""
         now = datetime.now()
-        cutoff = now - timedelta(days=SESSIONS_MAX_AGE_DAYS)
         # 既存のファイルデータを読み込み（未ロードチャンネルのセッション保持）
         data = self.load_sessions()
         # メモリ上のプロジェクトでデータを上書き
@@ -2084,8 +2085,6 @@ class ClaudeCodeRunner:
                 if not session.claude_session_id:
                     continue
                 created = session.created_at or now
-                if created < cutoff:
-                    continue
                 channel_sessions[thread_ts] = {
                     "thread_ts": session.thread_ts,
                     "channel_id": session.channel_id,
@@ -2096,29 +2095,10 @@ class ClaudeCodeRunner:
                     "created_at": created.isoformat(),
                     "prompts": session.prompts,
                 }
-            # チャンネルあたり上限を適用（古い順に削除）
-            if len(channel_sessions) > SESSIONS_MAX_PER_CHANNEL:
-                sorted_items = sorted(
-                    channel_sessions.items(),
-                    key=lambda x: x[1].get("created_at", ""),
-                )
-                channel_sessions = dict(sorted_items[-SESSIONS_MAX_PER_CHANNEL:])
             if channel_sessions:
                 data[channel_id] = channel_sessions
             else:
                 data.pop(channel_id, None)
-        # 未ロードチャンネルの古いセッションも期限切れ削除
-        for channel_id in list(data.keys()):
-            if channel_id in self.projects:
-                continue  # 上で処理済み
-            filtered = {
-                ts: s for ts, s in data[channel_id].items()
-                if s.get("created_at", "") >= cutoff.isoformat()
-            }
-            if filtered:
-                data[channel_id] = filtered
-            else:
-                del data[channel_id]
         try:
             dir_name = os.path.dirname(SESSIONS_FILE)
             fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
@@ -2300,24 +2280,19 @@ class ClaudeCodeRunner:
     def _restore_sessions(self, project: Project, channel_data: dict[str, dict]):
         """永続化データからSessionオブジェクトをProjectに復元"""
         now = datetime.now()
-        cutoff = now - timedelta(days=SESSIONS_MAX_AGE_DAYS)
         restored_count = 0
-        skipped_reasons: dict[str, list[str]] = {"in_memory": [], "expired": []}
+        skipped_reasons: dict[str, list[str]] = {"in_memory": []}
         for thread_ts, sdata in channel_data.items():
             # 既にメモリにあるセッションは上書きしない
             if thread_ts in project.sessions:
                 skipped_reasons["in_memory"].append(thread_ts)
                 continue
-            # 古いセッションは復元スキップ
             created_at_str = sdata.get("created_at")
             if created_at_str:
                 try:
                     created_at = datetime.fromisoformat(created_at_str)
                 except (ValueError, TypeError):
                     created_at = now
-                if created_at < cutoff:
-                    skipped_reasons["expired"].append(thread_ts)
-                    continue
             else:
                 created_at = now
             session = Session(
@@ -2332,9 +2307,9 @@ class ClaudeCodeRunner:
             )
             project.sessions[thread_ts] = session
             restored_count += 1
-        if skipped_reasons["in_memory"] or skipped_reasons["expired"]:
-            logger.info("_restore_sessions: restored=%d skipped_in_memory=%d skipped_expired=%d channel=%s",
-                        restored_count, len(skipped_reasons["in_memory"]), len(skipped_reasons["expired"]),
+        if skipped_reasons["in_memory"]:
+            logger.info("_restore_sessions: restored=%d skipped_in_memory=%d channel=%s",
+                        restored_count, len(skipped_reasons["in_memory"]),
                         project.channel_id)
 
     def get_channel_root(self, channel_id: str) -> Optional[str]:

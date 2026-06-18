@@ -106,7 +106,7 @@ Firing happens in `_execute`'s `finally` via `ClaudeCodeRunner._fire_one_followu
 ### Persistence
 
 - `directory_history.json` — Per-channel directory usage history (channel_id → [dir_path, ...]). Max 10 entries per channel.
-- `sessions.json` — Per-channel session data (claude_session_id, working_dir, label, etc.). Restored on bridge restart for `--resume` continuity. Unloaded channels' data is preserved across saves. Expired sessions (>7 days) are pruned. Max 50 sessions per channel.
+- `sessions.json` — Per-channel session data (claude_session_id, working_dir, label, etc.). Restored on bridge restart for `--resume` continuity. Unloaded channels' data is preserved across saves. No age expiry or per-channel count cap: as long as the underlying `claude_session_id` JSONL (`~/.claude/projects/*/<id>.jsonl`) survives on the Claude CLI side, `--resume` still works, so the bridge must not forget a still-resumable session. Entries are tiny (a few hundred bytes) and thread count is naturally bounded by usage.
 - `channel_roots.json` — Per-channel root directory settings (channel_id → path). Used by `root` command. Bare tasks in channels with a root set run immediately in that directory.
 - `session_history.json` — Thin records of finished sessions for the App Home dashboard (latest task's status/prompt/dir/user/timestamps/tool_count per thread). Global cap of 100 (`SESSION_HISTORY_MAX`). Written on session completion; survives restart (Task objects do not).
 - Tasks are volatile (in-memory only, lost on bridge restart).
