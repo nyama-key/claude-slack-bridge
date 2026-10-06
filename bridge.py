@@ -1271,6 +1271,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     last_posted_text: Optional[str] = None  # 重複投稿防止用
     latest_text: Optional[str] = None  # 最新のテキスト応答（進捗メッセージ内に表示）
     plan_posted = False  # 静かなモード: 対応方針（作業前の最初のテキスト）を投稿済みか
+    plan_msg: Optional[tuple[str, str]] = None  # 静かなモード: 投稿した対応方針 (ts, 本文)。終了時に作業中の一文を外す
     history_len_at_text = 0  # 静かなモード: 最新テキスト受信時点の all_status_history 長
     last_jsonl_update: float = time.time()  # 最終JSONL更新時刻（ハートビート表示用）
     _HEARTBEAT_INTERVAL = 30  # ハートビート更新間隔（秒）
@@ -1488,7 +1489,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     def _post_plan_once(before_tool: bool = False):
         """静かなモード: 作業前に書かれた最初のテキストを「対応方針」として1回だけ投稿する。
         テキストの後にツール実行が続いたときだけ投稿する（ツールを使わない返答は完了メッセージのみ）。"""
-        nonlocal plan_posted
+        nonlocal plan_posted, plan_msg
         if plan_posted or not latest_text:
             return
         # テキストより前にツールが動いていたら、それは方針ではなく途中経過なので投稿しない
@@ -1499,14 +1500,27 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             return
         plan_posted = True
         plan = latest_text if len(latest_text) <= 2800 else latest_text[:2800] + "\n..."
+        body = f"{t('plan_header')}\n\n{plan}"
+        working = f"{body}\n\n{t('plan_working')}"
         try:
-            client.chat_postMessage(
+            resp = client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f"{t('plan_header')}\n{plan}",
-                blocks=[{"type": "markdown", "text": f"{t('plan_header')}\n\n{plan}"}],
+                text=working, blocks=[{"type": "markdown", "text": working}],
             )
+            plan_msg = (resp["ts"], body)
         except Exception as e:
             logger.error("Plan post error PID %d: %s", pid, e)
+
+    def _close_plan():
+        """静かなモード: 作業が終わったら対応方針から「作業中」の一文を外す。"""
+        if not plan_msg:
+            return
+        ts, body = plan_msg
+        try:
+            client.chat_update(channel=channel, ts=ts, text=body,
+                               blocks=[{"type": "markdown", "text": body}])
+        except Exception as e:
+            logger.debug("Plan close error (best-effort): %s", e)
 
     def _update_text(text: str):
         """応答テキストを進捗メッセージに統合表示。同一テキストの重複更新を防止。"""
@@ -1839,6 +1853,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     # 残った進捗を確定
     _finalize_progress()
+    _close_plan()
 
     # watchdog 停止
     watcher.stop()

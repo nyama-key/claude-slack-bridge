@@ -170,7 +170,9 @@ class TestQuietPlan:
         inst = {"pid": 999999, "jsonl_path": str(path), "task": bridge.Task(id=1, prompt="p"),
                 "start_from_beginning": True, "skip_exit_message": True,
                 "fixed_jsonl": True, "cwd": str(tmp_path)}
+        client.chat_postMessage.return_value = {"ts": "2.0"}
         bridge._monitor_session_jsonl(inst, "1.0", "C1", client)
+        TestQuietPlan.last_client = client
         return [c.kwargs["text"] for c in client.chat_postMessage.call_args_list]
 
     @staticmethod
@@ -183,6 +185,11 @@ class TestQuietPlan:
         posts = self._run(tmp_path, [self._a({"type": "text", "text": "- 読む\n- 直す"}),
                                      self._a(self.TOOL), self._a({"type": "text", "text": "完了"})])
         assert len(posts) == 1 and "- 読む" in posts[0] and "完了" not in posts[0]
+        assert bridge.t("plan_working") in posts[0]
+        # 作業が終わったら「作業中」の一文を外す
+        update = self.last_client.chat_update.call_args.kwargs
+        assert update["ts"] == "2.0" and "- 読む" in update["text"]
+        assert bridge.t("plan_working") not in update["text"]
 
     def test_simple_answer_has_no_plan(self, tmp_path):
         assert self._run(tmp_path, [self._a({"type": "text", "text": "答え"})]) == []

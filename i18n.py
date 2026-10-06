@@ -289,6 +289,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "slack_upload_rejected": ":warning: 添付できなかったファイル: {files}",
         "plan_header": "📝 **対応方針**",
+        "plan_working": "⏳ _このまま作業を続けています。終わったら結果をお送りします。_",
         "prompt_quiet_style": (
             "返答はスマホのSlackで読まれる。"
             "ファイルの読み書きやコマンド実行が必要な依頼では、ツールを使う前に、まず対応方針を2〜4個の短い箇条書きで書く"
@@ -625,6 +626,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "slack_upload_rejected": ":warning: Files not attached: {files}",
         "plan_header": "📝 **Plan**",
+        "plan_working": "⏳ _Still working on it. I'll post the result when done._",
         "prompt_quiet_style": (
             "Replies are read in Slack on a phone. "
             "If the request needs file edits or commands, first write your plan as 2-4 short bullets before using any tool "
