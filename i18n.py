@@ -288,6 +288,13 @@ MESSAGES: dict[str, dict[str, str]] = {
             "応答に [SLACK_UPLOAD:相対パス] マーカーを出力してください。Slackスレッドに添付されます。"
         ),
         "slack_upload_rejected": ":warning: 添付できなかったファイル: {files}",
+        "prompt_quiet_style": (
+            "最終返答はスマホのSlackで読まれる。途中経過は送られず、最終返答だけが届く。"
+            "最終返答は、まず結論を1〜2文、続けて要点を3〜5個の短い箇条書きで書く。"
+            "ユーザーに判断してほしいことがあれば最後に1つだけ質問する。"
+            "コマンド、ツールの出力、コード、ファイルパスの羅列は、ユーザーが求めたとき以外は書かない。"
+            "作業手順の実況や「〜を確認しました」の列挙はしない。"
+        ),
         "prompt_allowed_tools_info": (
             "\n現在あなたに許可されているツール: {tools}。"
             "これ以外のツールが必要な場合（例: 許可リストにないBashコマンドの実行、"
@@ -613,6 +620,13 @@ MESSAGES: dict[str, dict[str, str]] = {
             "output a [SLACK_UPLOAD:relative/path] marker in your response. It will be attached to the Slack thread."
         ),
         "slack_upload_rejected": ":warning: Files not attached: {files}",
+        "prompt_quiet_style": (
+            "Your final reply is read in Slack on a phone; only the final reply is delivered, not progress. "
+            "Start with a 1-2 sentence conclusion, then 3-5 short bullet points. "
+            "If you need a decision from the user, end with a single question. "
+            "Do not include commands, tool output, code, or lists of file paths unless asked. "
+            "Do not narrate your steps."
+        ),
         "prompt_allowed_tools_info": (
             "\nYour currently allowed tools: {tools}. "
             "If you need any tool not in this list (e.g. a Bash command not matching the allowed pattern, "

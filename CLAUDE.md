@@ -85,6 +85,8 @@ Main logic is in `bridge.py`. Internationalization is in `i18n.py` (bilingual ja
 
 - **Child env (fork addition)** — `_CHILD_ENV_BLOCKLIST` strips `CLAUDECODE`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `GITHUB_TOKEN` from the `claude` subprocess environment. Tool-request approve/reject buttons also check `_is_user_allowed()`. `build_command` always appends `_BRIDGE_DIR_DENY_RULES` (`Read/Edit/Write(//<REPO_DIR>/**)`) to `--disallowedTools`, even when a task overrides `disallowed_tools`, so the child cannot read `.env` or modify the bridge. Residual: `Bash(git *)` can still read arbitrary files (e.g. `git diff --no-index`), so keep the Bash allowlist narrow. Install outside any directory mounted into other agents (e.g. NanoClaw's `~/projects`).
 
+- **Quiet mode (fork addition)** — `SLACK_QUIET_MODE` (default true in this fork). For bridge-run tasks, `_flush_progress` posts nothing (bind live mirroring is unaffected; questions/plan approvals still post), the completion message is just `label + elapsed` + Claude's final answer (no tools/tokens/cost header, no session footer, no progress/diff attachments), and `prompt_quiet_style` asks Claude for a short conclusion-first reply. Set `SLACK_QUIET_MODE=false` for upstream behavior.
+
 ### Data Flow
 
 1. Message event arrives via Socket Mode → `handle_message` routes by `channel_type`

@@ -127,3 +127,32 @@ class TestBridgeDirDenyRules:
     def test_kept_with_explicit_override(self):
         value = self._disallowed(bridge.Task(id=1, prompt="p", disallowed_tools=""))
         assert value == bridge._BRIDGE_DIR_DENY_RULES
+
+
+class TestQuietMode:
+    def test_enabled_by_default(self):
+        assert bridge.SLACK_QUIET_MODE is True
+
+    def test_completion_has_no_tool_or_token_details(self):
+        session = bridge.Session(thread_ts="1.0", channel_id="C1", working_dir="/tmp",
+                                 claude_session_id="abcdef123456789")
+        task = bridge.Task(id=1, prompt="p", status=bridge.TaskStatus.COMPLETED, result="結論です",
+                           tool_calls=[{"name": "Bash"}], input_tokens=1000, output_tokens=500)
+        fallback, blocks, _ = _bare_runner()._format_result(task, session, 12.0)
+        assert "Bash" not in fallback and "abcdef" not in fallback
+        assert [b["type"] for b in blocks] == ["section", "markdown"]
+        assert blocks[1]["text"] == "結論です"
+
+    def test_no_progress_or_diff_attachments(self):
+        runner = _bare_runner()
+        session = bridge.Session(thread_ts="1.0", channel_id="C1", working_dir="/tmp")
+        task = bridge.Task(id=1, prompt="p", status=bridge.TaskStatus.COMPLETED, result="ok")
+        task.file_diffs = ["--- a\n+++ b"]
+        runner._post_completion(session, task, "done", {"_status_history": ["step"]},
+                                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "h"}}])
+        runner.client.files_upload_v2.assert_not_called()
+
+    def test_style_prompt_appended(self):
+        cmd = _bare_runner().build_command(bridge.Task(id=1, prompt="p"))
+        prompt = cmd[cmd.index("--append-system-prompt") + 1]
+        assert bridge.t("prompt_quiet_style") in prompt

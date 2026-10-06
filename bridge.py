@@ -190,6 +190,9 @@ _SLACK_UPLOAD_RE = re.compile(r"\[SLACK_UPLOAD:([^\]]+)\]")
 SLACK_UPLOAD_MAX_FILES = 10
 SLACK_UPLOAD_MAX_BYTES = int(os.getenv("SLACK_UPLOAD_MAX_MB", "500")) * 1024 * 1024
 
+# 静かなモード: 途中経過を投稿せず、完了時に要約した最終結果だけを送る（このフォークの既定）
+SLACK_QUIET_MODE = os.getenv("SLACK_QUIET_MODE", "true").lower() in ("1", "true", "yes", "on")
+
 # claude 子プロセスに常に付与する deny ルール（"//" は絶対パス指定）
 _BRIDGE_DIR_DENY_RULES = ",".join(
     f"{tool}(/{REPO_DIR}/**)" for tool in ("Read", "Edit", "Write"))
@@ -1397,6 +1400,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         nonlocal status_msg_ts
         if not status_lines and not latest_text:
             return
+        if SLACK_QUIET_MODE and task_ref is not None and inst.get("bind_mode") != "live":
+            return
         if final:
             suffix = ""
         else:
@@ -2401,6 +2406,8 @@ class ClaudeCodeRunner:
         disallowed = ",".join(filter(None, [disallowed, _BRIDGE_DIR_DENY_RULES]))
         cmd.extend(["--disallowedTools", disallowed])
         system_prompt = t("prompt_system_append") + t("prompt_slack_upload_info")
+        if SLACK_QUIET_MODE:
+            system_prompt += t("prompt_quiet_style")
         if tools:
             system_prompt += t("prompt_allowed_tools_info", tools=tools)
         cmd.extend(["--append-system-prompt", system_prompt])
@@ -2818,6 +2825,8 @@ class ClaudeCodeRunner:
             token_line += "  " + t("task_cost_estimate", cost=cost)
             header_lines.append(token_line)
         header_text = "\n".join(header_lines)
+        if SLACK_QUIET_MODE:
+            header_text = f"{display_label}  {t('task_complete', elapsed=elapsed)}"
 
         full_result = None
         result_md: str | None = None
@@ -2830,7 +2839,7 @@ class ClaudeCodeRunner:
                 full_result = task.result
 
         footer_lines: list[str] = []
-        if session.claude_session_id:
+        if session.claude_session_id and not SLACK_QUIET_MODE:
             footer_lines.append(f"_Session: `{session.claude_session_id[:12]}...`_")
             footer_lines.append(t("task_reply_to_continue"))
         footer_text = "\n".join(footer_lines)
@@ -2930,7 +2939,7 @@ class ClaudeCodeRunner:
                 "filename": f"result_{task.short_id}.md",
                 "title": t("task_full_text_title"),
             })
-        if len(status_history) >= 1:
+        if len(status_history) >= 1 and not SLACK_QUIET_MODE:
             snippet_content = "\n".join(status_history)
             file_uploads.append({
                 "content": snippet_content,
@@ -2938,7 +2947,7 @@ class ClaudeCodeRunner:
                 "title": t("status_history_title"),
             })
         # Edit差分ファイル
-        if task.file_diffs:
+        if task.file_diffs and not SLACK_QUIET_MODE:
             diff_content = "\n\n".join(task.file_diffs)
             file_uploads.append({
                 "content": diff_content,
