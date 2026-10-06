@@ -168,9 +168,10 @@ APP_HOME_POLL_INTERVAL = 30      # 進行中セッションがある間の再 pu
 APP_HOME_VIEWER_TTL = 600        # app_home_opened を最後に受けてから再 publish 対象とみなす猶予（秒）
 
 # ── GitHub 更新チェック ──
-# 既定で1時間ごとに GitHub 上の最新版と手元の版を比較し、差があれば
+# GITHUB_UPDATE_CHECK=true のとき1時間ごとに GitHub 上の最新版と手元の版を比較し、差があれば
 # NOTIFICATION_CHANNEL に「アップデートがあります」とボタン付きで通知する。
-GITHUB_UPDATE_CHECK = os.getenv("GITHUB_UPDATE_CHECK", "true").lower() in ("1", "true", "yes", "on")
+# 未レビューの上流コードが適用されるのを避けるため、このフォークでは既定で無効。
+GITHUB_UPDATE_CHECK = os.getenv("GITHUB_UPDATE_CHECK", "false").lower() in ("1", "true", "yes", "on")
 GITHUB_UPDATE_INTERVAL = int(os.getenv("GITHUB_UPDATE_INTERVAL", "3600"))  # チェック間隔（秒）
 GITHUB_REPO = os.getenv("GITHUB_UPDATE_REPO", "nariakiiwatani/claude-slack-bridge")
 GITHUB_BRANCH = os.getenv("GITHUB_UPDATE_BRANCH", "main")
@@ -183,6 +184,45 @@ TEAM_EXTRA_TOOLS = "TeamCreate,TeamDelete,SendMessage,TaskCreate,TaskUpdate,Task
 
 # ツールリクエストマーカー検出用正規表現
 _TOOL_REQUEST_RE = re.compile(r"\[TOOL_REQUEST:([^\]]+)\]")
+
+# Slack アップロードマーカー検出用正規表現（作業ディレクトリ内のファイルをスレッドへ送る）
+_SLACK_UPLOAD_RE = re.compile(r"\[SLACK_UPLOAD:([^\]]+)\]")
+SLACK_UPLOAD_MAX_FILES = 10
+SLACK_UPLOAD_MAX_BYTES = int(os.getenv("SLACK_UPLOAD_MAX_MB", "500")) * 1024 * 1024
+
+# claude 子プロセスに常に付与する deny ルール（"//" は絶対パス指定）
+_BRIDGE_DIR_DENY_RULES = ",".join(
+    f"{tool}(/{REPO_DIR}/**)" for tool in ("Read", "Edit", "Write"))
+
+# claude 子プロセスへ渡さない環境変数（ブリッジ自身の認証情報）
+_CHILD_ENV_BLOCKLIST = {"CLAUDECODE", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "GITHUB_TOKEN"}
+
+
+def _resolve_upload_markers(result: str, working_dir: str) -> tuple[list[str], list[str]]:
+    """[SLACK_UPLOAD:path] マーカーを解決する。(アップロード可能な絶対パス, 却下理由) を返す。
+    working_dir 外・.git 配下・.env 系・存在しない/大きすぎるファイルは却下する。"""
+    paths: list[str] = []
+    rejected: list[str] = []
+    if not result or not working_dir:
+        return paths, rejected
+    root = os.path.realpath(working_dir)
+    for raw in dict.fromkeys(m.strip() for m in _SLACK_UPLOAD_RE.findall(result)):
+        if len(paths) >= SLACK_UPLOAD_MAX_FILES:
+            rejected.append(f"{raw} (too many files)")
+            continue
+        full = os.path.realpath(os.path.join(root, os.path.expanduser(raw)))
+        parts = os.path.relpath(full, root).split(os.sep)
+        if os.path.commonpath([root, full]) != root:
+            rejected.append(f"{raw} (outside working dir)")
+        elif ".git" in parts or os.path.basename(full).startswith(".env"):
+            rejected.append(f"{raw} (not allowed)")
+        elif not os.path.isfile(full):
+            rejected.append(f"{raw} (not found)")
+        elif os.path.getsize(full) > SLACK_UPLOAD_MAX_BYTES:
+            rejected.append(f"{raw} (too large)")
+        else:
+            paths.append(full)
+    return paths, rejected
 
 
 # ---------------------------------------------------------------------------
@@ -2357,9 +2397,10 @@ class ClaudeCodeRunner:
         # プラン承認後はtask.disallowed_tools="AskUserQuestion"が設定され、
         # ExitPlanModeが許可される。
         disallowed = task.disallowed_tools if task.disallowed_tools is not None else "AskUserQuestion,ExitPlanMode"
-        if disallowed:
-            cmd.extend(["--disallowedTools", disallowed])
-        system_prompt = t("prompt_system_append")
+        # ブリッジ自身のディレクトリ（.env のトークン・bridge.py）は常に読み書き禁止
+        disallowed = ",".join(filter(None, [disallowed, _BRIDGE_DIR_DENY_RULES]))
+        cmd.extend(["--disallowedTools", disallowed])
+        system_prompt = t("prompt_system_append") + t("prompt_slack_upload_info")
         if tools:
             system_prompt += t("prompt_allowed_tools_info", tools=tools)
         cmd.extend(["--append-system-prompt", system_prompt])
@@ -2486,7 +2527,7 @@ class ClaudeCodeRunner:
         try:
             # サブプロセス起動前のタイムスタンプを記録（JSONL検出用）
             start_time = time.time()
-            env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"} | {"LANG": "en_US.UTF-8"}
+            env = {k: v for k, v in os.environ.items() if k not in _CHILD_ENV_BLOCKLIST} | {"LANG": "en_US.UTF-8"}
 
             if use_pty:
                 # PTYモード: 疑似ターミナルでサブプロセスを起動
@@ -2904,6 +2945,21 @@ class ClaudeCodeRunner:
                 "filename": f"changes_{task.short_id}.diff",
                 "title": "Changes",
             })
+        # [SLACK_UPLOAD:path] マーカーのファイル
+        if task.status == TaskStatus.COMPLETED:
+            upload_paths, rejected = _resolve_upload_markers(task.result or "", session.working_dir)
+            for path in upload_paths:
+                file_uploads.append({
+                    "file": path,
+                    "filename": os.path.basename(path),
+                    "title": os.path.basename(path),
+                })
+            if rejected:
+                logger.warning("_post_completion: rejected uploads=%s thread=%s", rejected, session.thread_ts)
+                note = t("slack_upload_rejected", files=", ".join(rejected))
+                text += "\n" + note
+                if blocks:
+                    blocks = blocks + [{"type": "section", "text": {"type": "mrkdwn", "text": note}}]
 
         if blocks:
             # blocks付き: 本文を chat_postMessage で投稿、添付ファイルは別投稿
@@ -4025,6 +4081,9 @@ def _handle_tool_request_action(ack, body, scope: str):
     scope: "once" | "session" | "project" | "reject"
     """
     ack()
+    if not _is_user_allowed(body.get("user", {}).get("id", "")):
+        logger.warning("Tool request action: user not allowed")
+        return
     action = body["actions"][0]
     try:
         value = json.loads(action["value"])

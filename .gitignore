@@ -40,3 +40,4 @@ articles
 
 # Instance state
 .instance_state.json
+.venv/

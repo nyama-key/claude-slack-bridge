@@ -283,6 +283,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "例: [TOOL_REQUEST:Bash(npm install)] や [TOOL_REQUEST:WebFetch]。"
             "複数のツールが必要な場合は複数のマーカーを出力してください。"
         ),
+        "prompt_slack_upload_info": (
+            "作業ディレクトリ内のファイル（画像・動画など）をユーザーに見せたい場合は、"
+            "応答に [SLACK_UPLOAD:相対パス] マーカーを出力してください。Slackスレッドに添付されます。"
+        ),
+        "slack_upload_rejected": ":warning: 添付できなかったファイル: {files}",
         "prompt_allowed_tools_info": (
             "\n現在あなたに許可されているツール: {tools}。"
             "これ以外のツールが必要な場合（例: 許可リストにないBashコマンドの実行、"
@@ -603,6 +608,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Examples: [TOOL_REQUEST:Bash(npm install)] or [TOOL_REQUEST:WebFetch]. "
             "Output multiple markers if you need multiple tools."
         ),
+        "prompt_slack_upload_info": (
+            "To show the user a file in the working directory (image, video, etc.), "
+            "output a [SLACK_UPLOAD:relative/path] marker in your response. It will be attached to the Slack thread."
+        ),
+        "slack_upload_rejected": ":warning: Files not attached: {files}",
         "prompt_allowed_tools_info": (
             "\nYour currently allowed tools: {tools}. "
             "If you need any tool not in this list (e.g. a Bash command not matching the allowed pattern, "

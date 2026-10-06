@@ -554,7 +554,7 @@ class TestBuildCommandDisallowedTools:
         task = make_task(disallowed_tools=None)
         cmd = runner.build_command(task)
         idx = cmd.index("--disallowedTools")
-        assert cmd[idx + 1] == "AskUserQuestion,ExitPlanMode"
+        assert cmd[idx + 1] == "AskUserQuestion,ExitPlanMode," + bridge._BRIDGE_DIR_DENY_RULES
 
     def test_explicit_disallowed_tools(self, make_task):
         """明示指定ではその値が使われる（プラン承認後のケース）"""
@@ -562,14 +562,15 @@ class TestBuildCommandDisallowedTools:
         task = make_task(disallowed_tools="AskUserQuestion")
         cmd = runner.build_command(task)
         idx = cmd.index("--disallowedTools")
-        assert cmd[idx + 1] == "AskUserQuestion"
+        assert cmd[idx + 1] == "AskUserQuestion," + bridge._BRIDGE_DIR_DENY_RULES
 
     def test_empty_disallowed_tools(self, make_task):
-        """空文字列の場合は --disallowedTools が含まれない"""
+        """空文字列の場合もブリッジディレクトリの deny ルールだけは付与される"""
         runner = self._make_runner()
         task = make_task(disallowed_tools="")
         cmd = runner.build_command(task)
-        assert "--disallowedTools" not in cmd
+        idx = cmd.index("--disallowedTools")
+        assert cmd[idx + 1] == bridge._BRIDGE_DIR_DENY_RULES
 
 
 # ── _format_exit_plan_mode: is_plan_approval マーカー ────
