@@ -3408,6 +3408,64 @@ def get_bot_user_id():
     return BOT_USER_ID
 
 
+_user_name_cache: dict[str, str] = {}
+THREAD_CONTEXT_MAX_CHARS = 6000
+
+
+def _slack_user_name(user_id: str) -> str:
+    """Slack ユーザーID → 表示名（キャッシュ付き、失敗時はIDのまま）"""
+    if user_id not in _user_name_cache:
+        name = user_id
+        if user_id == BOT_USER_ID:
+            _user_name_cache[user_id] = "Claude MacB（あなた）"
+            return _user_name_cache[user_id]
+        try:
+            u = slack_client.users_info(user=user_id)["user"]
+            prof = u.get("profile", {})
+            name = prof.get("display_name") or prof.get("real_name") or u.get("name") or user_id
+        except Exception as e:
+            logger.debug("users_info failed for %s: %s", user_id, e)
+        _user_name_cache[user_id] = name
+    return _user_name_cache[user_id]
+
+
+def _readable_mentions(text: str) -> str:
+    """<@U123> を @表示名 に置き換える"""
+    return re.sub(r"<@([A-Z0-9]+)(?:\|[^>]*)?>", lambda m: "@" + _slack_user_name(m.group(1)), text or "")
+
+
+def _fetch_thread_context(channel_id: str, thread_ts: str, current_ts: str | None,
+                          requester_id: str | None = None) -> str:
+    """このボットの最後の発言より後に、スレッドで他の参加者（他のAIエージェントを含む）が書いた内容を返す。
+    ブリッジはボットの発言を無視してタスクを起こさないため、--resume の会話からは見えない。
+    今回のメッセージ自身は含めない。取得できなければ空文字。"""
+    try:
+        msgs = list(slack_client.conversations_replies(channel=channel_id, ts=thread_ts, limit=200).get("messages", []))
+    except Exception as e:
+        logger.warning("conversations_replies failed thread=%s: %s", thread_ts, e)
+        return ""
+    bot_uid = get_bot_user_id()
+    last_own = max((i for i, m in enumerate(msgs) if m.get("user") == bot_uid), default=-1)
+    lines: list[str] = []
+    for m in msgs[last_own + 1:]:
+        if m.get("ts") == current_ts or m.get("user") == bot_uid or m.get("subtype") in ("channel_join", "bot_add"):
+            continue
+        text = _readable_mentions(m.get("text", "")).strip()
+        if not text:
+            continue
+        if requester_id and m.get("user") == requester_id:
+            name = "依頼者"
+        else:
+            name = (m.get("bot_profile") or {}).get("name") or (m.get("user") and _slack_user_name(m["user"])) or "unknown"
+        if len(text) > 1500:
+            text = text[:1500] + "..."
+        lines.append(f"- {name}: {text}")
+    context = "\n".join(lines)
+    if len(context) > THREAD_CONTEXT_MAX_CHARS:
+        context = "...\n" + context[-THREAD_CONTEXT_MAX_CHARS:]
+    return context
+
+
 def parse_task_id(s: str) -> Optional[int]:
     m = re.match(r"#?(\d+)", s.strip())
     return int(m.group(1)) if m else None
@@ -3662,6 +3720,12 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
         file_paths = _download_slack_files(files, session.working_dir)
         if file_paths:
             prompt = _augment_prompt_with_files(prompt, file_paths)
+
+    # 前回の返答以降にスレッドで他の参加者（Dot など）が書いた内容を添える
+    prompt = _readable_mentions(prompt)
+    context = _fetch_thread_context(session.channel_id, thread_ts, request_msg_ts, user_id)
+    if context:
+        prompt = t("prompt_thread_context", context=context, message=prompt)
 
     # セッションにclaude_session_idがまだ設定されていない場合、短時間待機
     # （前タスクの_executeがJSONL処理中の可能性があるため）

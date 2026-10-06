@@ -87,6 +87,8 @@ Main logic is in `bridge.py`. Internationalization is in `i18n.py` (bilingual ja
 
 - **Quiet mode (fork addition)** — `SLACK_QUIET_MODE` (default true in this fork). For bridge-run tasks, `_flush_progress` posts nothing (bind live mirroring is unaffected; questions/plan approvals still post), the completion message is just `label + elapsed` + Claude's final answer (no tools/tokens/cost header, no session footer, no progress/diff attachments), and `prompt_quiet_style` asks Claude for a short conclusion-first reply. Before work, the first assistant text that is followed by a tool call is posted once as `plan_header` (対応方針) via `_post_plan_once` — text after a tool has run, or a tool-less answer, is never posted as a plan. The plan ends with `plan_working` (作業中の一文) while the process runs; `_close_plan` edits it out when the monitor finishes. Set `SLACK_QUIET_MODE=false` for upstream behavior.
 
+- **Thread context (fork addition)** — The bridge ignores bot messages, so other agents in the thread (e.g. Dot) were invisible to `--resume` tasks. `_handle_thread_reply_task` now prepends `_fetch_thread_context()` (via `conversations.replies`): every non-self message after the bridge bot's last post, excluding the current one, labelled by `bot_profile.name` / `依頼者` / user name, wrapped in `prompt_thread_context` as reference data (not instructions). Capped at 1500 chars per message and `THREAD_CONTEXT_MAX_CHARS` total. User names need `users:read`; without it they fall back to IDs.
+
 ### Data Flow
 
 1. Message event arrives via Socket Mode → `handle_message` routes by `channel_type`

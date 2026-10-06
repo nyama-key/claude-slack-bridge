@@ -198,3 +198,38 @@ class TestQuietPlan:
         posts = self._run(tmp_path, [self._a(self.TOOL), self._a({"type": "text", "text": "途中"}),
                                      self._a({**self.TOOL, "id": "t2"})])
         assert posts == []
+
+
+class TestThreadContext:
+    """スレッドで他の参加者（Dot など）が書いた内容を、次のタスクに添える"""
+
+    MSGS = [
+        {"ts": "1.0", "user": "UNOB", "text": "<@UBOT> <@UDOT> 動画の数を数えて"},
+        {"ts": "1.1", "user": "UDOT", "bot_profile": {"name": "Dot"}, "text": "確認します"},
+        {"ts": "1.2", "user": "UBOT", "text": "4本です"},
+        {"ts": "1.3", "user": "UDOT", "bot_profile": {"name": "Dot"}, "text": "全体では8本です"},
+        {"ts": "1.4", "user": "UNOB", "text": "Dotが正しい"},
+    ]
+
+    def _run(self, monkeypatch, msgs, current_ts):
+        monkeypatch.setattr(bridge, "BOT_USER_ID", "UBOT")
+        monkeypatch.setattr(bridge, "_user_name_cache", {"UNOB": "nobuyuki", "UDOT": "Dot", "UBOT": "Claude MacB"})
+        client = MagicMock()
+        client.conversations_replies.return_value = {"messages": msgs}
+        monkeypatch.setattr(bridge, "slack_client", client)
+        return bridge._fetch_thread_context("C1", "1.0", current_ts)
+
+    def test_only_messages_after_own_last_reply(self, monkeypatch):
+        ctx = self._run(monkeypatch, self.MSGS, "1.4")
+        assert ctx == "- Dot: 全体では8本です"
+
+    def test_mentions_are_readable_before_first_reply(self, monkeypatch):
+        ctx = self._run(monkeypatch, self.MSGS[:2], "9.9")
+        assert "@Claude MacB @Dot 動画の数を数えて" in ctx and "- Dot: 確認します" in ctx
+
+    def test_api_failure_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(bridge, "BOT_USER_ID", "UBOT")
+        client = MagicMock()
+        client.conversations_replies.side_effect = Exception("missing_scope")
+        monkeypatch.setattr(bridge, "slack_client", client)
+        assert bridge._fetch_thread_context("C1", "1.0", "1.4") == ""
