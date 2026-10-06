@@ -156,3 +156,38 @@ class TestQuietMode:
         cmd = _bare_runner().build_command(bridge.Task(id=1, prompt="p"))
         prompt = cmd[cmd.index("--append-system-prompt") + 1]
         assert bridge.t("prompt_quiet_style") in prompt
+
+
+class TestQuietPlan:
+    """静かなモード: ツール実行前の最初のテキストだけを「対応方針」として投稿する"""
+
+    @staticmethod
+    def _run(tmp_path, entries):
+        import json
+        path = tmp_path / "s.jsonl"
+        path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        client = MagicMock()
+        inst = {"pid": 999999, "jsonl_path": str(path), "task": bridge.Task(id=1, prompt="p"),
+                "start_from_beginning": True, "skip_exit_message": True,
+                "fixed_jsonl": True, "cwd": str(tmp_path)}
+        bridge._monitor_session_jsonl(inst, "1.0", "C1", client)
+        return [c.kwargs["text"] for c in client.chat_postMessage.call_args_list]
+
+    @staticmethod
+    def _a(*content):
+        return {"type": "assistant", "message": {"role": "assistant", "content": list(content)}}
+
+    TOOL = {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "x"}}
+
+    def test_plan_posted_before_work(self, tmp_path):
+        posts = self._run(tmp_path, [self._a({"type": "text", "text": "- 読む\n- 直す"}),
+                                     self._a(self.TOOL), self._a({"type": "text", "text": "完了"})])
+        assert len(posts) == 1 and "- 読む" in posts[0] and "完了" not in posts[0]
+
+    def test_simple_answer_has_no_plan(self, tmp_path):
+        assert self._run(tmp_path, [self._a({"type": "text", "text": "答え"})]) == []
+
+    def test_text_after_tool_is_not_plan(self, tmp_path):
+        posts = self._run(tmp_path, [self._a(self.TOOL), self._a({"type": "text", "text": "途中"}),
+                                     self._a({**self.TOOL, "id": "t2"})])
+        assert posts == []

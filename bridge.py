@@ -1270,6 +1270,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     all_status_history: list[str] = []    # 全ステータス履歴（完了時スニペット用）
     last_posted_text: Optional[str] = None  # 重複投稿防止用
     latest_text: Optional[str] = None  # 最新のテキスト応答（進捗メッセージ内に表示）
+    plan_posted = False  # 静かなモード: 対応方針（作業前の最初のテキスト）を投稿済みか
+    history_len_at_text = 0  # 静かなモード: 最新テキスト受信時点の all_status_history 長
     last_jsonl_update: float = time.time()  # 最終JSONL更新時刻（ハートビート表示用）
     _HEARTBEAT_INTERVAL = 30  # ハートビート更新間隔（秒）
     _last_heartbeat: float = 0  # 前回ハートビート更新時刻
@@ -1401,6 +1403,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         if not status_lines and not latest_text:
             return
         if SLACK_QUIET_MODE and task_ref is not None and inst.get("bind_mode") != "live":
+            _post_plan_once()
             return
         if final:
             suffix = ""
@@ -1482,15 +1485,39 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         if status_msg_ts and (status_lines or latest_text):
             _flush_progress(final=True)
 
+    def _post_plan_once(before_tool: bool = False):
+        """静かなモード: 作業前に書かれた最初のテキストを「対応方針」として1回だけ投稿する。
+        テキストの後にツール実行が続いたときだけ投稿する（ツールを使わない返答は完了メッセージのみ）。"""
+        nonlocal plan_posted
+        if plan_posted or not latest_text:
+            return
+        # テキストより前にツールが動いていたら、それは方針ではなく途中経過なので投稿しない
+        if any(not h.startswith(("💬", ":thought_balloon:")) for h in all_status_history[:history_len_at_text - 1]):
+            plan_posted = True
+            return
+        if not before_tool and len(all_status_history) <= history_len_at_text:
+            return
+        plan_posted = True
+        plan = latest_text if len(latest_text) <= 2800 else latest_text[:2800] + "\n..."
+        try:
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f"{t('plan_header')}\n{plan}",
+                blocks=[{"type": "markdown", "text": f"{t('plan_header')}\n\n{plan}"}],
+            )
+        except Exception as e:
+            logger.error("Plan post error PID %d: %s", pid, e)
+
     def _update_text(text: str):
         """応答テキストを進捗メッセージに統合表示。同一テキストの重複更新を防止。"""
-        nonlocal last_posted_text, latest_text
+        nonlocal last_posted_text, latest_text, history_len_at_text
         if text == last_posted_text:
             return  # 同一テキストの重複更新を防止
         last_posted_text = text
         latest_text = text  # 進捗メッセージ内に表示
         # テキスト応答も履歴に追加（完了時スニペットに含めるため）
         all_status_history.append(f"💬\n{text}")
+        history_len_at_text = len(all_status_history)
         # 進捗メッセージを更新（新規メッセージは投稿しない）
         _flush_progress()
 
@@ -1678,6 +1705,12 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _extract_task_info(entry)
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
+                    # 静かなモード: ツールより前のテキスト（対応方針）を後続テキストと混ぜない
+                    if SLACK_QUIET_MODE and text_parts:
+                        _update_text("\n".join(text_parts))
+                        text_parts = []
+                    if SLACK_QUIET_MODE:
+                        _post_plan_once(before_tool=True)
                     # thinkingが来たら新しいセットを開始（最新セットのみ表示）
                     if text.startswith(":thought_balloon:"):
                         status_lines = []
@@ -1746,6 +1779,12 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _extract_task_info(entry)
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
+                    # 静かなモード: ツールより前のテキスト（対応方針）を後続テキストと混ぜない
+                    if SLACK_QUIET_MODE and text_parts:
+                        _update_text("\n".join(text_parts))
+                        text_parts = []
+                    if SLACK_QUIET_MODE:
+                        _post_plan_once(before_tool=True)
                     # thinkingが来たら新しいセットを開始（最新セットのみ表示）
                     if text.startswith(":thought_balloon:"):
                         status_lines = []

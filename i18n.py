@@ -288,8 +288,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "応答に [SLACK_UPLOAD:相対パス] マーカーを出力してください。Slackスレッドに添付されます。"
         ),
         "slack_upload_rejected": ":warning: 添付できなかったファイル: {files}",
+        "plan_header": "📝 **対応方針**",
         "prompt_quiet_style": (
-            "最終返答はスマホのSlackで読まれる。途中経過は送られず、最終返答だけが届く。"
+            "返答はスマホのSlackで読まれる。"
+            "ファイルの読み書きやコマンド実行が必要な依頼では、ツールを使う前に、まず対応方針を2〜4個の短い箇条書きで書く"
+            "（この方針だけは作業前にユーザーへ送られる）。質問に答えるだけなら方針は書かずに答える。"
+            "その後の途中経過は送られず、最終返答だけが届く。"
             "最終返答は、まず結論を1〜2文、続けて要点を3〜5個の短い箇条書きで書く。"
             "ユーザーに判断してほしいことがあれば最後に1つだけ質問する。"
             "コマンド、ツールの出力、コード、ファイルパスの羅列は、ユーザーが求めたとき以外は書かない。"
@@ -620,8 +624,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "output a [SLACK_UPLOAD:relative/path] marker in your response. It will be attached to the Slack thread."
         ),
         "slack_upload_rejected": ":warning: Files not attached: {files}",
+        "plan_header": "📝 **Plan**",
         "prompt_quiet_style": (
-            "Your final reply is read in Slack on a phone; only the final reply is delivered, not progress. "
+            "Replies are read in Slack on a phone. "
+            "If the request needs file edits or commands, first write your plan as 2-4 short bullets before using any tool "
+            "(only this plan is sent to the user before you work). For a simple question, just answer. "
+            "After that, progress is not delivered; only the final reply is. "
             "Start with a 1-2 sentence conclusion, then 3-5 short bullet points. "
             "If you need a decision from the user, end with a single question. "
             "Do not include commands, tool output, code, or lists of file paths unless asked. "
